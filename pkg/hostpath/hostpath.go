@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -89,6 +90,7 @@ type Config struct {
 	MaxVolumeExpansionSizeNode    int64
 	CheckVolumeLifecycle          bool
 	EnableListSnapshots           bool
+	OverlayMode                   bool
 }
 
 var (
@@ -105,6 +107,9 @@ func NewHostPathDriver(cfg Config) (*hostPath, error) {
 		return nil, errors.New("no driver name provided")
 	}
 
+	// Detect overlay mode from driver name
+	cfg.OverlayMode = strings.Contains(cfg.DriverName, "overlay")
+
 	if cfg.NodeID == "" {
 		return nil, errors.New("no node id provided")
 	}
@@ -119,6 +124,9 @@ func NewHostPathDriver(cfg Config) (*hostPath, error) {
 
 	klog.Infof("Driver: %v ", cfg.DriverName)
 	klog.Infof("Version: %s", cfg.VendorVersion)
+	if cfg.OverlayMode {
+		klog.Infof("OverlayMode: enabled (driver name contains 'overlay')")
+	}
 
 	s, err := state.New(path.Join(cfg.StateDir, "state.json"))
 	if err != nil {

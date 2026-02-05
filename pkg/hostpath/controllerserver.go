@@ -870,6 +870,11 @@ func (hp *hostPath) validateControllerServiceRequest(c csi.ControllerServiceCapa
 }
 
 func (hp *hostPath) getControllerServiceCapabilities() []*csi.ControllerServiceCapability {
+	// Overlay mode has no controller capabilities - it wraps existing volumes, not provisions new ones
+	if hp.config.OverlayMode {
+		return []*csi.ControllerServiceCapability{}
+	}
+
 	var cl []csi.ControllerServiceCapability_RPC_Type
 	if !hp.config.Ephemeral {
 		cl = []csi.ControllerServiceCapability_RPC_Type{

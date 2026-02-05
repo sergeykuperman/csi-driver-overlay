@@ -47,6 +47,24 @@ func (hp *hostPath) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.Prob
 
 func (hp *hostPath) GetPluginCapabilities(ctx context.Context, req *csi.GetPluginCapabilitiesRequest) (*csi.GetPluginCapabilitiesResponse, error) {
 	klog.V(5).Infof("Using default capabilities")
+
+	// Overlay mode returns minimal capabilities - just CONTROLLER_SERVICE (required by spec)
+	// but with no actual controller capabilities advertised
+	if hp.config.OverlayMode {
+		klog.V(5).Infof("Overlay mode: returning minimal capabilities")
+		return &csi.GetPluginCapabilitiesResponse{
+			Capabilities: []*csi.PluginCapability{
+				{
+					Type: &csi.PluginCapability_Service_{
+						Service: &csi.PluginCapability_Service{
+							Type: csi.PluginCapability_Service_CONTROLLER_SERVICE,
+						},
+					},
+				},
+			},
+		}, nil
+	}
+
 	caps := []*csi.PluginCapability{
 		{
 			Type: &csi.PluginCapability_Service_{
