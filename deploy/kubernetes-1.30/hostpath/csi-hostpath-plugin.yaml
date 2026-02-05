@@ -204,7 +204,7 @@ subjects:
 - kind: ServiceAccount
   name: csi-hostpathplugin-sa
 ---
-kind: StatefulSet
+kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: csi-hostpathplugin
@@ -215,11 +215,6 @@ metadata:
     app.kubernetes.io/name: csi-hostpathplugin
     app.kubernetes.io/component: plugin
 spec:
-  serviceName: "csi-hostpathplugin"
-  # One replica only:
-  # Host path driver only works when everything runs
-  # on a single node.
-  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/instance: hostpath.csi.k8s.io
@@ -235,11 +230,49 @@ spec:
         app.kubernetes.io/component: plugin
     spec:
       serviceAccountName: csi-hostpathplugin-sa
+      nodeSelector:
+        "com.sap.devx.group/type": "workspaces"
+      tolerations:
+      - key: WorkGroup
+        operator: Equal
+        value: "ws"
+        effect: NoExecute
+      - key: WorkGroup
+        operator: Equal
+        value: "ws"
+        effect: NoSchedule
+      initContainers:
+        # InitContainer that copies golden image to node-local cache
+        - name: golden-image-cache
+          image: 407233961683.dkr.ecr.eu-north-1.amazonaws.com/overlay-csi@sha256:76c6ba7bed26810d56aa7944cfffce776c8819faea95685943737bcdfd4c4dec
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Checking golden image cache..."
+              CACHE_DIR="/var/lib/overlay-csi/golden-image"
+              MARKER_FILE="$CACHE_DIR/.populated"
+              if [ -f "$MARKER_FILE" ]; then
+                echo "Cache already populated, skipping copy"
+              else
+                echo "Populating cache from golden image..."
+                mkdir -p "$CACHE_DIR"
+                cp -a /golden-image/. "$CACHE_DIR/"
+                touch "$MARKER_FILE"
+                echo "Cache populated successfully"
+              fi
+              echo "Cache contents:"
+              ls -la "$CACHE_DIR" | head -20
+          volumeMounts:
+            - name: golden-image
+              mountPath: /golden-image
+              readOnly: true
+            - name: overlay-cache
+              mountPath: /var/lib/overlay-csi
       containers:
         - name: hostpath
-          image: registry.k8s.io/sig-storage/hostpathplugin:v1.17.0
+          image: 407233961683.dkr.ecr.eu-north-1.amazonaws.com/overlay-csi@sha256:76c6ba7bed26810d56aa7944cfffce776c8819faea95685943737bcdfd4c4dec
           args:
-            - "--drivername=hostpath.csi.k8s.io"
+            - "--drivername=overlay.csi.io"
             - "--v=5"
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--nodeid=$(KUBE_NODE_NAME)"
@@ -279,27 +312,17 @@ spec:
               name: csi-data-dir
             - mountPath: /dev
               name: dev-dir
+            - mountPath: /var/lib/overlay-csi
+              name: overlay-cache
 
-        - name: csi-external-health-monitor-controller
-          image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.16.0
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-            - "--leader-election"
-          env:
-            - name: ADDRESS
-              value: /csi/csi.sock
-          imagePullPolicy: "IfNotPresent"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /csi
+        # csi-external-health-monitor-controller removed - not needed for ephemeral overlay driver
 
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0
           args:
             - --v=5
             - --csi-address=/csi/csi.sock
-            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-hostpath/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-overlay/csi.sock
           securityContext:
             # This is necessary only for systems with SELinux, where
             # non-privileged sidecar containers cannot access unix domain socket
@@ -328,69 +351,16 @@ spec:
           - --csi-address=/csi/csi.sock
           - --health-port=9898
 
-        - name: csi-attacher
-          image: registry.k8s.io/sig-storage/csi-attacher:v4.10.0
-          args:
-            - --v=5
-            - --csi-address=/csi/csi.sock
-          securityContext:
-            # This is necessary only for systems with SELinux, where
-            # non-privileged sidecar containers cannot access unix domain socket
-            # created by privileged CSI driver container.
-            privileged: true
-          volumeMounts:
-          - mountPath: /csi
-            name: socket-dir
-
-        - name: csi-provisioner
-          image: registry.k8s.io/sig-storage/csi-provisioner:v6.0.0
-          args:
-            - -v=5
-            - --csi-address=/csi/csi.sock
-            - --feature-gates=Topology=true
-            # end csi-provisioner args
-          securityContext:
-            # This is necessary only for systems with SELinux, where
-            # non-privileged sidecar containers cannot access unix domain socket
-            # created by privileged CSI driver container.
-            privileged: true
-          volumeMounts:
-            - mountPath: /csi
-              name: socket-dir
-
-        - name: csi-resizer
-          image: registry.k8s.io/sig-storage/csi-resizer:v2.0.0
-          args:
-            - -v=5
-            - -csi-address=/csi/csi.sock
-          securityContext:
-            # This is necessary only for systems with SELinux, where
-            # non-privileged sidecar containers cannot access unix domain socket
-            # created by privileged CSI driver container.
-            privileged: true
-          volumeMounts:
-            - mountPath: /csi
-              name: socket-dir
-
-        - name: csi-snapshotter
-          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.4.0
-          args:
-            - -v=5
-            - --csi-address=/csi/csi.sock
-          securityContext:
-            # This is necessary only for systems with SELinux, where
-            # non-privileged sidecar containers cannot access unix domain socket
-            # created by privileged CSI driver container.
-            privileged: true
-          volumeMounts:
-            - mountPath: /csi
-              name: socket-dir
+        # csi-attacher removed - not needed for ephemeral overlay driver
+        # csi-provisioner removed - not needed for ephemeral overlay driver
+        # csi-resizer removed - not needed for ephemeral overlay driver
+        # csi-snapshotter removed - not needed for ephemeral overlay driver
 
         # end csi containers
 
       volumes:
         - hostPath:
-            path: /var/lib/kubelet/plugins/csi-hostpath
+            path: /var/lib/kubelet/plugins/csi-overlay
             type: DirectoryOrCreate
           name: socket-dir
         - hostPath:
@@ -415,4 +385,12 @@ spec:
             path: /dev
             type: Directory
           name: dev-dir
+        - hostPath:
+            path: /var/lib/overlay-csi
+            type: DirectoryOrCreate
+          name: overlay-cache
+        - name: golden-image
+          image:
+            reference: 407233961683.dkr.ecr.eu-north-1.amazonaws.com/my-ecr@sha256:e1ea159ecfe30cb234186c5ea3f0966acc9e7f1dee775f42e758ad2d7965da9f
+            pullPolicy: IfNotPresent
         # end csi volumes
