@@ -26,6 +26,37 @@ Example pod manifests are available in the `examples/` directory:
 - `examples/overlay-pod.yaml` - Pod using overlay volume
 - `examples/image-pod.yaml` - Pod using image-backed volume
 
+## How It Works
+
+The CSI Overlay Driver provides **OverlayFS-based volumes** for pods, enabling a copy-on-write storage model where a read-only "golden image" layer is merged with a writable PVC layer.
+
+1. **Golden Image Layer (Lower)**: A pre-cached read-only base image stored at `/var/lib/overlay-csi/golden-image` on each node. This is populated by a DaemonSet InitContainer at cluster startup.
+
+2. **Writable Layer (Upper)**: A user-provided PVC that stores all modifications. Changes to files are written here while the original golden image remains untouched.
+
+3. **OverlayFS Mount**: When a pod requests an overlay volume, the driver creates an OverlayFS mount combining:
+   - `lowerdir` → golden image cache (read-only)
+   - `upperdir` → PVC mount path (writable)
+   - `workdir` → work directory on the PVC
+
+### Key Features
+
+- **Copy-on-Write**: Pods see a merged filesystem; writes go to the PVC while reads can come from either layer
+- **Shared Base Image**: Multiple pods can share the same golden image, saving disk space
+- **Persistent Changes**: Modifications persist in the PVC across pod restarts
+- **Configurable Timeout**: Wait timeout for dependent PVC mounts is configurable via volume context
+
+### Volume Context Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `overlay.csi.io/backside-pvc` | Name of the PVC to use as the writable upper layer (required) |
+| `overlay.csi.io/wait-timeout` | Timeout for waiting on PVC mount (default: 120s) |
+
+### Use Case
+
+Ideal for workloads that need a consistent base environment (development tools, libraries, runtime) while allowing per-pod customizations that persist across restarts.
+
 ---
 
 # CSI Hostpath Driver (Upstream)
