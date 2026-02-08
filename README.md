@@ -1,4 +1,34 @@
-# CSI Hostpath Driver
+# CSI Overlay Driver
+
+This is a fork of the [CSI Hostpath Driver](https://github.com/kubernetes-csi/csi-driver-host-path) with overlay filesystem support.
+
+## Fork Changes
+
+This fork adds the following customizations:
+
+- **Overlay filesystem support** - Extended node server to support overlay mounts
+- **Modified driver identity** - Updated driver name and capabilities for overlay use case
+- **Simplified deployment** - Streamlined deployment manifests and scripts
+
+### Quick Deployment
+
+```bash
+# Deploy the driver
+deploy/kubernetes-latest/deploy.sh
+
+# Remove the driver
+deploy/kubernetes-latest/destroy.sh
+```
+
+### Example Usage
+
+Example pod manifests are available in the `examples/` directory:
+- `examples/overlay-pod.yaml` - Pod using overlay volume
+- `examples/image-pod.yaml` - Pod using image-backed volume
+
+---
+
+# CSI Hostpath Driver (Upstream)
 
 This repository hosts the CSI Hostpath driver and all of its build and dependent configuration files to deploy the driver.
 
