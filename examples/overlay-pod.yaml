@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rook-test-pod
+  namespace: test
+  labels:
+    app: pull-secret-manager
+    projected-token-mount.resources.gardener.cloud/skip: "true"
+    apiserver-proxy.networking.gardener.cloud/inject: "disable"
+spec:
+  nodeSelector:
+    "com.sap.devx.group/type": "workspaces"
+  tolerations:
+  - key: WorkGroup
+    operator: Equal
+    value: "ws"
+    effect: NoExecute
+  - key: WorkGroup
+    operator: Equal
+    value: "ws"
+    effect: NoSchedule
+  containers:
+    - name: shell
+      image: debian:bookworm-slim
+      command: ["bash", "-lc"]
+      args:
+        - |
+          echo "Listing /mnt/test:"
+          ls -la /mnt/test | head -200
+          sleep infinity
+      volumeMounts:
+        - name: workspace
+          mountPath: /mnt/test
+        # Mount the backside PVC so kubelet mounts it before the overlay CSI driver needs it
+        - name: my-rook-data
+          mountPath: /mnt/.backside
+  volumes:
+    - name: my-rook-data
+      persistentVolumeClaim:
+        claimName: rook-pvc
+    - name: workspace
+      csi:
+        driver: overlay.csi.io
+        volumeAttributes:
+          # Volume name of the backside PVC in this pod spec
+          overlay.csi.io/backside-pvc: "my-rook-data"

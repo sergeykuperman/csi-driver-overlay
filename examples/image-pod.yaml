@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: image-volume-private-ecr
+  namespace: test
+  labels:
+    app: pull-secret-manager
+    projected-token-mount.resources.gardener.cloud/skip: "true"
+    apiserver-proxy.networking.gardener.cloud/inject: "disable"
+spec:
+  containers:
+    - name: shell
+      image: debian:bookworm-slim
+      command: ["bash", "-lc"]
+      args:
+        - |
+          echo "Listing /mnt/test:"
+          ls -la /mnt/test | head -200
+          sleep infinity
+      volumeMounts:
+        - name: product-tree
+          mountPath: /mnt/test
+          readOnly: false
+  volumes:
+    - name: product-tree
+      image:
+        reference: 407233961683.dkr.ecr.eu-north-1.amazonaws.com/my-ecr@sha256:e1ea159ecfe30cb234186c5ea3f0966acc9e7f1dee775f42e758ad2d7965da9f
+        pullPolicy: IfNotPresent
