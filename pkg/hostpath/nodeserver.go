@@ -17,14 +17,16 @@ limitations under the License.
 package hostpath
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-driver-host-path/pkg/state"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -36,6 +38,17 @@ const (
 	TopologyKeyNode = "topology.hostpath.csi/node"
 
 	failedPreconditionAccessModeConflict = "volume uses SINGLE_NODE_SINGLE_WRITER access mode and is already mounted at a different target path"
+
+	// Overlay volume context keys
+	overlayBacksidePVC = "overlay.csi.io/backside-pvc" // Volume name of the backside PVC in the pod spec
+	overlayWaitTimeout = "overlay.csi.io/wait-timeout" // Optional: timeout for waiting on volumes
+
+	// Default timeout and interval for waiting on dependent volumes
+	defaultWaitTimeout  = 120 * time.Second
+	defaultWaitInterval = 500 * time.Millisecond
+
+	// Static path for the golden image cache (populated by DaemonSet InitContainer)
+	goldenImageCachePath = "/var/lib/overlay-csi/golden-image"
 )
 
 func (hp *hostPath) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -51,6 +64,12 @@ func (hp *hostPath) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 	}
 
 	targetPath := req.GetTargetPath()
+
+	// Handle overlay mode separately
+	if hp.config.OverlayMode {
+		return hp.nodePublishOverlayVolume(ctx, req, targetPath)
+	}
+
 	ephemeralVolume := req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "true" ||
 		req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "" && hp.config.Ephemeral // Kubernetes 1.15 doesn't have csi.storage.k8s.io/ephemeral.
 
@@ -206,6 +225,103 @@ func (hp *hostPath) NodePublishVolume(ctx context.Context, req *csi.NodePublishV
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
+// nodePublishOverlayVolume handles the overlay mode NodePublishVolume operation.
+// It creates an OverlayFS mount that merges a pre-cached golden image (lower) with a PVC (upper).
+// The golden image is cached on the node by the DaemonSet InitContainer at startup.
+func (hp *hostPath) nodePublishOverlayVolume(ctx context.Context, req *csi.NodePublishVolumeRequest, targetPath string) (*csi.NodePublishVolumeResponse, error) {
+	volCtx := req.GetVolumeContext()
+	mounter := mount.New("")
+
+	backsidePVCName := volCtx[overlayBacksidePVC]
+	if backsidePVCName == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "volume context missing required key: %s", overlayBacksidePVC)
+	}
+
+	podUID := volCtx["csi.storage.k8s.io/pod.uid"]
+	if podUID == "" {
+		return nil, status.Error(codes.InvalidArgument, "volume context missing pod UID (csi.storage.k8s.io/pod.uid)")
+	}
+
+	// Parse optional timeout
+	timeout := defaultWaitTimeout
+	if timeoutStr := volCtx[overlayWaitTimeout]; timeoutStr != "" {
+		parsed, err := time.ParseDuration(timeoutStr)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid wait timeout %q: %v", timeoutStr, err)
+		}
+		timeout = parsed
+	}
+
+	klog.V(4).Infof("overlay: publishing volume %s with backsidePVC=%s, podUID=%s",
+		req.GetVolumeId(), backsidePVCName, podUID)
+
+	// Check if already mounted (idempotency)
+	notMnt, err := mount.IsNotMountPoint(mounter, targetPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Target doesn't exist, create it
+			if err := os.MkdirAll(targetPath, 0750); err != nil {
+				return nil, status.Errorf(codes.Internal, "create target path: %v", err)
+			}
+			notMnt = true
+		} else {
+			return nil, status.Errorf(codes.Internal, "check target path: %v", err)
+		}
+	}
+
+	if !notMnt {
+		// Already mounted, return success (idempotent)
+		klog.V(4).Infof("overlay: volume already mounted at %s", targetPath)
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
+
+	// Use static golden image cache path (populated by DaemonSet InitContainer)
+	lowerDir := goldenImageCachePath
+
+	// Verify the golden image cache exists and is populated
+	markerFile := filepath.Join(lowerDir, ".populated")
+	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
+		return nil, status.Errorf(codes.FailedPrecondition, "golden image cache not populated at %s - CSI driver InitContainer may have failed", lowerDir)
+	}
+	klog.V(4).Infof("overlay: using golden image cache at %s", lowerDir)
+
+	// Wait for PVC to be ready
+	klog.V(4).Infof("overlay: waiting for PVC (name=%s) to be ready", backsidePVCName)
+	upperBaseDir, err := waitForPVCMount(ctx, podUID, backsidePVCName, timeout, defaultWaitInterval)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "overlay: %v", err)
+	}
+	klog.V(4).Infof("overlay: found PVC mount at %s", upperBaseDir)
+
+	// Create upper and work directories inside the upper base
+	upperDir := filepath.Join(upperBaseDir, "upper")
+	workDir := filepath.Join(upperBaseDir, "work")
+
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create overlay upper dir: %v", err)
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create overlay work dir: %v", err)
+	}
+
+	// Mount the overlay filesystem
+	// Options format: lowerdir=...,upperdir=...,workdir=...
+	options := []string{
+		fmt.Sprintf("lowerdir=%s", lowerDir),
+		fmt.Sprintf("upperdir=%s", upperDir),
+		fmt.Sprintf("workdir=%s", workDir),
+	}
+
+	klog.V(4).Infof("overlay: mounting overlay at %s with options: %v", targetPath, options)
+
+	if err := mounter.Mount("overlay", targetPath, "overlay", options); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to mount overlay: %v", err)
+	}
+
+	klog.V(4).Infof("overlay: volume %s successfully published at %s", req.GetVolumeId(), targetPath)
+	return &csi.NodePublishVolumeResponse{}, nil
+}
+
 func (hp *hostPath) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 
 	// Check arguments
@@ -217,6 +333,11 @@ func (hp *hostPath) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubl
 	}
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
+
+	// Handle overlay mode separately - simplified cleanup without state tracking
+	if hp.config.OverlayMode {
+		return hp.nodeUnpublishOverlayVolume(ctx, req, targetPath, volumeID)
+	}
 
 	// Lock before acting on global state. A production-quality
 	// driver might use more fine-grained locking.
@@ -267,7 +388,45 @@ func (hp *hostPath) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpubl
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
+// nodeUnpublishOverlayVolume handles overlay mode unpublish.
+// It simply unmounts the overlay and removes the target directory.
+// Upper/work directories are NOT cleaned up - they live on the PVC with its own lifecycle.
+func (hp *hostPath) nodeUnpublishOverlayVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest, targetPath, volumeID string) (*csi.NodeUnpublishVolumeResponse, error) {
+	mounter := mount.New("")
+
+	// Check if target is mounted
+	notMnt, err := mount.IsNotMountPoint(mounter, targetPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Path doesn't exist, already cleaned up - return success (idempotent)
+			klog.V(4).Infof("overlay: target path %s does not exist, nothing to do", targetPath)
+			return &csi.NodeUnpublishVolumeResponse{}, nil
+		}
+		return nil, status.Errorf(codes.Internal, "check target path: %v", err)
+	}
+
+	if !notMnt {
+		// Unmount the overlay
+		klog.V(4).Infof("overlay: unmounting %s", targetPath)
+		if err := mounter.Unmount(targetPath); err != nil {
+			return nil, status.Errorf(codes.Internal, "unmount overlay: %v", err)
+		}
+	}
+
+	// Remove target directory
+	if err := os.RemoveAll(targetPath); err != nil {
+		return nil, status.Errorf(codes.Internal, "remove target path: %v", err)
+	}
+
+	klog.V(4).Infof("overlay: volume %s has been unpublished from %s", volumeID, targetPath)
+	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
 func (hp *hostPath) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	// Overlay mode doesn't use staging - ephemeral inline volumes skip staging
+	if hp.config.OverlayMode {
+		return nil, status.Error(codes.Unimplemented, "NodeStageVolume is not supported in overlay mode")
+	}
 
 	// Check arguments
 	if len(req.GetVolumeId()) == 0 {
@@ -314,6 +473,10 @@ func (hp *hostPath) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolum
 }
 
 func (hp *hostPath) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	// Overlay mode doesn't use staging - ephemeral inline volumes skip staging
+	if hp.config.OverlayMode {
+		return nil, status.Error(codes.Unimplemented, "NodeUnstageVolume is not supported in overlay mode")
+	}
 
 	// Check arguments
 	if len(req.GetVolumeId()) == 0 {
@@ -375,6 +538,27 @@ func (hp *hostPath) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest
 }
 
 func (hp *hostPath) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+	// Overlay mode returns minimal capabilities - no staging, no expansion
+	if hp.config.OverlayMode {
+		caps := []*csi.NodeServiceCapability{
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_VOLUME_CONDITION,
+					},
+				},
+			},
+			{
+				Type: &csi.NodeServiceCapability_Rpc{
+					Rpc: &csi.NodeServiceCapability_RPC{
+						Type: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+					},
+				},
+			},
+		}
+		return &csi.NodeGetCapabilitiesResponse{Capabilities: caps}, nil
+	}
+
 	caps := []*csi.NodeServiceCapability{
 		{
 			Type: &csi.NodeServiceCapability_Rpc{
@@ -555,3 +739,67 @@ func isMountedElsewhere(req *csi.NodePublishVolumeRequest, vol state.Volume) boo
 	}
 	return false
 }
+
+// waitForPVCMount waits for the PVC volume to be mounted and returns its path.
+func waitForPVCMount(ctx context.Context, podUID, volumeName string, timeout, interval time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		// Try to find PVC mount path
+		if path, err := findPVCMountPath(podUID, volumeName); err == nil {
+			return path, nil
+		}
+
+		klog.V(5).Infof("overlay: waiting for PVC volume=%s in pod=%s", volumeName, podUID)
+		time.Sleep(interval)
+	}
+
+	return "", fmt.Errorf("timeout waiting for PVC %s in pod %s", volumeName, podUID)
+}
+
+// findPVCMountPath searches for a PVC volume mount path in the pod's volumes directory.
+// PVC volumes are mounted at: /var/lib/kubelet/pods/<uid>/volumes/kubernetes.io~csi/<pv-name>/mount
+// Since we don't know the PV name, we need to search all CSI volumes in the pod's directory.
+// The volumeName parameter is the volume name from the pod spec (not the PV name).
+func findPVCMountPath(podUID, volumeName string) (string, error) {
+	csiVolumesDir := filepath.Join("/var/lib/kubelet/pods", podUID, "volumes/kubernetes.io~csi")
+
+	entries, err := os.ReadDir(csiVolumesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("CSI volumes directory not found: %s", csiVolumesDir)
+		}
+		return "", fmt.Errorf("failed to read CSI volumes directory: %w", err)
+	}
+
+	// For each CSI volume, check if it's the one we're looking for
+	// Since we can't directly map volume name to PV name, we look for any PVC mount
+	// and rely on there being only one PVC in the expected location
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Skip our own overlay CSI volume (which has the format workspace or similar)
+		// PVC volumes have names like "pvc-xxx-xxx-xxx"
+		name := entry.Name()
+		if !strings.HasPrefix(name, "pvc-") {
+			continue
+		}
+
+		mountPath := filepath.Join(csiVolumesDir, name, "mount")
+		if _, err := os.Stat(mountPath); err == nil {
+			klog.V(4).Infof("overlay: found PVC mount path=%s (PV=%s, requested volume=%s)", mountPath, name, volumeName)
+			return mountPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("PVC mount not found for volume %s in pod %s", volumeName, podUID)
+}
+

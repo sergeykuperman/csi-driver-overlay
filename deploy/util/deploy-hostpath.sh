@@ -180,7 +180,12 @@ INSTALL_CRD=${INSTALL_CRD:-"false"}
 # Some images are not affected by *_REGISTRY/*_TAG and IMAGE_* variables.
 # The default is to update unless explicitly excluded.
 update_image () {
-    case "$1" in socat) return 1;; esac
+    case "$1" in
+        socat) return 1;;
+        busybox) return 1;;
+        overlay-csi*) return 1;;
+        my-ecr*) return 1;;
+    esac
 }
 
 run () {
@@ -271,16 +276,21 @@ for i in $(ls ${BASE_DIR}/hostpath/*.yaml | sort); do
     fi
     modified="$(cat "$temp_yaml" | sed -e "s;${default_kubelet_data_dir}/;${KUBELET_DATA_DIR}/;" | while IFS= read -r line; do
         nocomments="$(echo "$line" | sed -e 's/ *#.*$//')"
-        if echo "$nocomments" | grep -q '^[[:space:]]*image:[[:space:]]*'; then
+        if echo "$nocomments" | grep -q '^[[:space:]]*image:[[:space:]]*[^[:space:]]'; then
             # Split 'image: quay.io/k8scsi/csi-attacher:v1.0.1'
             # into image (quay.io/k8scsi/csi-attacher:v1.0.1),
             # registry (quay.io/k8scsi),
             # name (csi-attacher),
             # tag (v1.0.1).
             image=$(echo "$nocomments" | sed -e 's;.*image:[[:space:]]*;;')
+            # Skip if image is empty (e.g., Kubernetes Image Volume spec with nested reference)
+            if [ -z "$image" ]; then
+                echo "$line"
+                continue
+            fi
             registry=$(echo "$image" | sed -e 's;\(.*\)/.*;\1;')
-            name=$(echo "$image" | sed -e 's;.*/\([^:]*\).*;\1;')
-            tag=$(echo "$image" | sed -e 's;.*:;;')
+            name=$(echo "$image" | sed -e 's;.*/\([^:@]*\).*;\1;')
+            tag=$(echo "$image" | sed -e 's;.*[:@];;')
 
             # Variables are with underscores and upper case.
             varname=$(echo $name | tr - _ | tr a-z A-Z)
